@@ -1,0 +1,158 @@
+---
+title: "R_0"
+author: "Daniel T. Citron"
+date: "1/9/2020"
+output: html_document
+---
+
+# Chapter 3 - $$R_0$$
+
+```{r}
+library(epimdr)
+```
+
+Measles data from 2003 in Niger
+```{r}
+data("niamey")
+head(niamey)
+```
+
+Plot cases over time: (Figure 3.1 in the text)
+```{r}
+par(mar = c(5,5,2,5))
+plot(niamey$absweek, niamey$tot_cases, type="b", xlab="Week", ylab="Incidence") 
+par(new=T)
+
+plot(niamey$absweek, niamey$cum_cases, type="l", col="red", axes=FALSE, xlab=NA, ylab=NA, log="y")
+
+axis(side = 4)
+mtext(side = 4, line = 4, "Cumulative incidence") 
+legend("topleft", legend=c("Cases", "Cumulative"), lty=c(1,1), pch=c(1,NA), col=c("black", "red"))
+```
+
+We calculate R0 using the apparent log-linear property of the data. Based on the initial exponential increase rate, we can then derive an expression for $R_0$ which we use in the next code block: $$R_0 = Vr + 1$$. In this case, the serial interval $V$ is between 10 and 12 days
+
+```{r}
+fit <- lm(log(cum_cases) ~ absweek, subset=absweek < 7, data = niamey)
+r = fit$coefficients["absweek"]
+V = c(10/7,13/7)
+V*r + 1
+```
+
+## Maximum Likelihood: The Chain-Binomial Model
+
+The Chain-binomial model was originally proposed by Bailey. It is a discrete-time stochastic alternative version to the continuous-time deterministic SIR model.
+
+We are going to say that the probability that any given susceptible escapes contact during a period $t = 1$ is
+$$1 - \exp{-\beta I /N}$$
+Within the chain binomial model, the number of people who become infected during a single $t=1$ time step is governed by this probability distribution
+$$I_{t+1} \sim Binomial\left(n = S_t, p = 1 - \exp{-\beta I_t/N} \right)$$
+meaning that the number of susceptibles at time $t+1$ is found using the cumulative number of infecteds 
+$$ S_{t + 1} = S_t - I_{t+1} = S_0 - \sum_{1}^{t+1} I_t $$
+
+We can now think of the likelihood of getting $I_{t+1}$ people removed from the pool of susceptibles in terms of this probability distribution. The `dbinom` function takes 3 arguments: 
+1. $I_{t+1}$, or the number that was removed
+2. $n = S_t$, or the number of susceptibles at $t$
+3. $p = 1 - \exp{-\beta I_t/N}$, or the probability of removing one susceptible
+And we can calculate the sum of the log likelihoods as follows:
+```{r}
+llik.cb <- function(S0, beta, I){
+  T = length(I) # number of time steps
+  S = floor(S0 - cumsum(I[-T])) # number of susceptibles over time
+  p = 1 - exp(-beta*(I[-T])/S0)
+  L = - sum(dbinom(I[-1], S, p, log = TRUE))
+  return(L)
+}
+```
+
+Have to do some data processing; aggregate data into 2-week intervals
+```{r}
+ # a way of adding together weekly data in pairs
+twoweek = rep(1:15, each = 2)
+y = sapply(split(niamey$cases_1[1:30], twoweek), sum)
+sum(y)
+
+```
+
+We are going to use our maximum likelihood method to estimate $S_0$ and $\beta$ together, but first let's just assume $S_0 = 6500$ and search values of $\beta$ to find a maximum likelihood:
+```{r}
+S0.init <- 6500
+beta.cand <- seq(0,10,by = .1)
+ll.vec <- rep(NA, length(beta.cand))
+
+for (i in 1:length(beta.cand)){
+  ll.vec[[i]] = llik.cb(S0 = S0.init, beta = beta.cand[[i]], I = y)
+}
+
+plot(ll.vec ~ beta.cand, ylab = "Neg Log Lik", xlab = expression(beta))
+```
+Find the value of beta which maximizes the log likelihood, or minimizes the negative log likelihood
+```{r}
+beta.cand[which.min(ll.vec)]
+```
+
+Assume that the guess of $\beta = 2.3$ is right, and search for the optimum value of $S_0$:
+```{r}
+beta.init <- 2.3
+S0.cand <-seq(6000,9000, length=101)
+
+ll.vec <- rep(NA, length(S0.cand))
+
+for (i in 1:length(S0.cand)){
+  ll.vec[[i]] = llik.cb(S0 = S0.cand[[i]], beta = beta.init, I = y)
+}
+
+plot(ll.vec ~ S0.cand, ylab = "Neg Log Lik", xlab = expression(S0))
+```
+```{r}
+S0.cand[which.min(ll.vec)]
+```
+
+Now our goal is to vary both parameters simultaneously; we can use `optim` or `mle-2` from the `bbmle` package
+```{r}
+library(bbmle)
+
+
+fit=mle2(llik.cb, # negative log likelihood function
+         start=list(S0=7085, beta=2.3),  # starting conditions
+         method="Nelder-Mead", # some kind of method...
+         data = list(I = y))  # the data we are fitting to
+
+summary(fit)
+```
+
+Our maximum likelihood estimates of our free parameters are $\beta = 1.89$ and $S_0 = 7815$. And we can easily obtain confidence intervals:
+```{r}
+confint(fit)
+```
+
+We can also get some correlations out of this fit:
+```{r}
+cov2cor(vcov(fit))
+```
+
+We can now use these parameters to simulate forward:
+```{r}
+sim.cb=function(S0, beta, I0){ 
+  I=I0
+  S=S0
+  i=1 
+  while(!any(I==0)){
+    i=i+1
+    I[i]=rbinom(1, size=S[i-1], prob=1- exp(-beta*I[i-1]/S0)) 
+    S[i]=S[i-1]-I[i]
+    }
+  out=data.frame(S=S, I=I)
+  return(out) 
+}
+```
+
+```{r}
+plot(y, type="n", xlim=c(1,18), ylab="Predicted/observed", xlab="Week")
+for(i in 1:100){
+  sim=sim.cb(S0=floor(coef(fit)["S0"]), beta=coef(fit)["beta"], I0=11)
+  lines(sim$I, col=grey(.5))
+}
+points(y, type="b", col=2)
+```
+

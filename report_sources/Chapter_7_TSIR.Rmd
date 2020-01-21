@@ -1,0 +1,429 @@
+---
+title: "Chapter_7_TSIR"
+author: "Daniel T. Citron"
+date: "1/9/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Time Series SIR Modeling and Analysis
+
+
+## Stochastic Variability
+Consider chain-binomial models, where there is some kind of "environmental stochasticity" that adds randomness into the process - who becomes infected, and who recovers?
+
+The TSIR model uses a discrete time step equal to the generation time of the parasite (or, I suppose, whatever is the smallest time scale in the model?)
+$$ \begin{split}
+S_{t + 1} &= B_t + S_t - I_t \\
+\lambda_{t+1} &= \beta \frac{S_t I_t^\alpha}{N_t}  \\
+\end{split}$$
+
+(The exponent $\alpha$ accounts for the discretization, citing Glass 2003). We use the $\lambda$ that we calculate at each time step as the expected number of new infected people - in practice we perform a draw (negative binomial or poisson or something)
+
+Below, we define a new function `SimTSIR` which lets us simulate a chain binomial model and also allow for some stochastic variation in the parameter $\beta$.
+```{r SimTSIR}
+SimTSIR = function(alpha = 0.97, B = 2300, beta = 25, 
+                   sdbeta = 0, S0 = 0.06, I0 = 180, Tmax = 520, N = 3.3E6){
+  # Set up simulation
+  lambda = rep(NA, Tmax)
+  I = rep(NA, Tmax)
+  S = rep(NA, Tmax)
+  # Initial conditions
+  I[1] = I0
+  lambda[1] = I0
+  S[1] = S0*N
+  # Run the simulation, simulate for Tmax time steps
+  for(i in 2:Tmax){
+    # perform draw for beta
+    beta.t <- rnorm(1, mean=beta, sd=sdbeta)
+    lambda[i] = beta.t * I[i-1]^alpha * S[i - 1]/N
+    if(lambda[i] < 0) {lambda[i] = 0}
+    # Perform draw, using lambda as the expected number infected
+    I[i] = rpois(1, lambda[i])
+    # Reset number of susceptibles
+    S[i] = S[i - 1] + B - I[i]
+  }
+  # Return result
+  list(I = I, S = S)
+}
+```
+
+The default parameters above let us simulate for measles in London, 3.3 Million inhabitants.
+```{r}
+out = SimTSIR()
+par(mfrow=c(1,2))
+plot(out$I, ylab="Infected", xlab="Time", type="l") 
+plot(out$S, out$I, ylab="Infected", xlab="Susceptible", type="l")
+```
+So here we've simulated forward - we've started with known parameters and produced a model which represents a family of trajectories associated with those parameters.
+
+In this case, however, we've introduce "process error" where by there is some uncertainty in how strong the transmission is as it varies from day to day.
+The strategy that we used before in Chapter 3 is an example of "trajectory matching" - we found the parameter sets that gave rise to trajectories that most closely matched the data. There are, of course, other approaches:
+
+* Gradient matching - good in the presence of strong process noise - estimating derivatives and choosing parameters that match those derivatives
+* Probe matching - choose parameters to match the "critical dynamical features"
+* Hierarchical modeling - using MCMC - POMP
+* Time Series SIR 
+
+## Introducing the Time Series SIR (TSIR) model
+
+Can we use basic statistical tools to analyze the dynamics of our simulations?
+
+For this example, refer to the biweekly measles data:
+```{r Measles Data}
+library(epimdr)
+
+data(meas)
+head(meas)
+```
+
+Here's the candidate for estimation: 
+
+$$ \log(\lambda_{t+1}) = \log(\beta) + \alpha \log{I_{t}} + \log{S_t} - \log{N_t} $$
+Note: there's a typo in the book, but I've changed it to be about inferring lambda from these other parameters. Lambda is the unknown parameter that lets us connect past time steps to future ones; the SIR model specifies mechanistically how we relate past data to future data. This equation is what we use to set up a regression, and shows us which data inputs we need to find.
+
+This is a generalized linear model with a $\log$-link.
+The unknown parameters are $\beta$ and $\alpha$. The terms $\log S_t$ and $\log N_t$ are treated as offsets.
+
+Here's how we express this in R code
+```{r, eval= FALSE}
+# Align the time series
+Tmax = length(meas$London)
+Inow = log(meas$London[2:Tmax])
+Ilag = log(meas$London[1:(Tmax-1)])
+# Slag = log(S[1:(Tmax-1)]) # S does not exist yet but we'll build it
+
+# Now the regression
+glm(Inow ~ Ilag + offset(Slag) + offset(-N))
+```
+
+Note that we've included a vector above `S` which hasn't yet been defined - this reflects the fact that often it is challenging to know some of these state variables. For example, we don't always have a stable count of susceptibles, and we don't always get an accurate count of infections that occur (due to underreporting).
+
+In this case, we can try to reconstruct the population of susceptibles based on birth rate:
+$$ S_t = \bar{S} + D_0 + \sum_{k=0}^t B_k - \sum_{k = 0}^t I_k/\rho $$
+
+Here, $\bar{S}$ is the mean number of susceptibles, $D_0$ accounts for unknown deviations around the mean at time 0, and $rho$ is the (known or unknown) reporting rate. From this we can reconstruct the time series $D_t = S_t - S_0$ as follows:
+$$ \sum_{k=0}^t B_k = \bar{S}  + \sum_{k = 0}^t I_k/\rho + D_t - D_0$$
+
+$D_t$ is therefore the residual from the regression of cumulative number of births on the cumulative number of cases. This is how the number of susceptibles deviate from the mean value: $S_t = \bar S$ (Moving forward, it appears that they've incorporated any appearance of $D_0$ into the time series $D_t$, allowing $D_t$ to encompass the entirety)
+
+
+```{r}
+# Use a spline method to find a relationship between the birth rate and the measles cases, from which we can take the residuals and find D_t:
+cum.reg = smooth.spline(cumsum(meas$B), cumsum(meas$London), df = 5)
+# Take away the residuals
+D = - resid(cum.reg)
+
+plot(cumsum(meas$B), cumsum(meas$London), type = "l",
+     xlab = "Cumulative Births", ylab = "Cumulative Incidence")
+lines(cum.reg)
+abline(a = 0, b = 1)
+```
+
+We compare the cumulative data and the spline fit `cum.reg` to a 1-to-1 line, showing how the cumulative number of cases are less than the cumulative nnumber of births. In this particular instance, we know that all children born in this era were infected through serology - therefore, the slope of the cumulative regression line is an estimate of the reporting rate:
+```{r}
+rr = predict(cum.reg, deriv = 1)$y
+summary(rr)
+```
+
+We can also create a time series corrected for reporting of birth incidence and susceptible deviation - the "true" estimated numbers of susceptibles and incidence
+```{r}
+Ic = meas$London/rr
+Dc = D/rr
+```
+
+### And now, the TSIR regression for real:
+We rewrite the model from above as follows, this time taking into account the data and unknown parameters on a log-scale.
+
+$$\log\lambda_{t+1} = \log \beta_u - \log N + \log \left(D_t + \bar{S}\right) + \alpha\log I_t$$
+The above expression has unknown parameters $\beta_u$, $\alpha$, and $\bar{S}$. The $u$ subscript on $\beta$ reflects the seasonal variation in transmission (from the school year; we change interactions over time from that). Assuming that $\beta_u$ varies for each 2-week period in the data, we end up with 28 free parameters to estimate.
+
+We have derived reporting-rate corrected data for $D_t$ and $I_t$. Let us define vectors `I.new` and `I.old` so we can compare the change in $I$ from one biweekly time step to the next:
+```{r}
+seas = rep(1:26, 21)[1:545] # seasonality vector, for indexing according to the biweekly period during each year
+log.I.new = log(Ic[2:546])
+log.I.old = log(Ic[1:545])
+D.old = Dc[1:545]
+```
+
+Given a known value for $\bar S$ the model falls within the linear regression framework. (Recall: $D_t + \bar S \approx S_t$, which we use as a proxy because we don't know $S_t$ - we are able to derive $D_t$ from some additional analysis of Birth and Case data, combined with some serological data from that era)
+
+We use a `glm` to find a profile likelihood estimate of $\bar S$. From serology, the proportion of susceptibles during this period in London was between 2-20% of the total 3.3 Million residents. From this we postulate the following:
+```{r}
+N = 3.3E6
+Smean.can = seq(0.02, 0.2, by = 0.001) * N # range of candidate values for Smean
+offsetN = rep(-log(N), 545)
+```
+
+
+Set up a vector to store the log-likelihood values corresponding to each candidate $\bar S$ = `Smean` value. Here's the crucial trick: we are going to use the same regression model that we will be fitting later to obtain the likelihood.
+```{r}
+llik.Smean = rep(NA, length(Smean.can))
+for(i in 1:length(Smean.can)){
+  log.S.old = log(Smean.can[i] + D.old) # this is S_t, but using the different guesses for what Smean is...
+  # -1 to remove the intercept
+  # note the trick that as.factor allows us to pull: we index each of the seasonal biweekly periods by their level within the factor; we don't need to create a full list of 26 different variables to fit - this works because the other covariates are ordered in time; because the levels of seas is also ordered in time they match with the ordering of other covariates
+  glmfit = glm(log.I.new ~ -1 + as.factor(seas) + log.I.old + offset(log.S.old + offsetN))
+  llik.Smean[i] = glmfit$deviance / 2
+}
+
+par(mfrow=c(1,1))
+plot(Smean.can/N, llik.Smean, ylim = c(min(llik.Smean), 25), 
+     xlab = "Sbar", ylab = "Neg log-like")
+```
+The value of $\bar S$ = `Smean` maximizes the likelihood?
+```{r}
+Smean.can[which.min(llik.Smean)]/N
+```
+
+Now we can identify the best estimates for the TSIR model:
+```{r TSIR regression}
+log.S.old = log(Smean.can[which(llik.Smean == min(llik.Smean))] + D.old)
+glmfit.best = glm(log.I.new ~ -1 + as.factor(seas) + log.I.old + offset(log.S.old + offsetN)) 
+```
+
+We can pull out $\alpha$, the coefficient for `log.I.old`:
+```{r}
+glmfit.best$coefficients[27]
+```
+We can pull out the log-$\beta$ values using the other 26 coefficients; we can even plot how they vary seasonally. Note the signficant variation in values, and how i
+```{r}
+require(plotrix) 
+beta=exp(glmfit$coef[1:26]) 
+ubeta=exp(glmfit$coef[1:26] + summary(glmfit)$coef[1:26, 2])  # upper bound, using standard errors for each one
+lbeta=exp(glmfit$coef[1:26] -summary(glmfit)$coef[1:26, 2])  # lower bound, using standard errors for each one
+plotCI(x=c(1:26), y=beta, ui=ubeta, li=lbeta,
+                                      xlab="Biweek", ylab=expression(beta))
+```
+
+## Simulating the TSIR model
+
+We can simulate either deterministic or stochastic versions of the TSIR model
+```{r}
+SimTsir2=function(beta, alpha, B, N, inits = list(Snull = 0, Inull = 0), type = "det"){ 
+  # first decide which type of simulation we will do
+  type = charmatch(type, c("det", "stoc"), nomatch = NA) 
+  if(is.na(type)) 
+    stop("method should be \"det\", \"stoc\"")
+  
+  # second set up vectors of variables to catch simulated outputs
+  IT = length(B)
+  s = length(beta) 
+  lambda = rep(NA, IT) 
+  I = rep(NA, IT)
+  S = rep(NA, IT) 
+  
+  # third set innitial conditiosn
+  I[1] = inits$Inull
+  lambda[1] = inits$Inull
+  S[1] = inits$Snull
+  
+  # fourth simulate
+  # note that we check on whether it's a stoc or det sim:
+  for(i in 2:IT) {
+    lambda[i] = beta[((i - 2) %% s) + 1] * S[i - 1] * (I[i - 1]^alpha)/N
+    if(type == 2) { # stochastic, draw from poisson model
+      I[i] = rpois(1, lambda[i]) }
+    if(type == 1) { # deterministic, use mean number of coutns
+      I[i] = lambda[i]}
+    S[i] =S[i - 1] + B[i] - I[i] }
+  
+  # return output  
+  return(list(I = I, S = S)) 
+}
+```
+
+Now we simulate using the parameters fit in the Time Series regression exercise:
+```{r}
+sim=SimTsir2(beta=exp(glmfit.best$coef[1:26]), 
+             alpha=0.966, 
+             B=meas$B, 
+             N=N, 
+             inits=list(Snull=Dc[1]+ Smean.can[which(llik.Smean==min(llik.Smean))], Inull=Ic[1]))
+# plot
+plot(sim$I, type="b", ylim=c(0, max(Ic)), ylab="Incidence", xlab="Biweek")
+lines(exp(log.I.new), col="red")
+legend("topleft", legend=c("sim", "Ic"), lty=c(1,1), pch=c(1,NA), col=c("black", "red"))
+```
+
+## Tycho Data
+The Tycho data set was collected from 40 US cities, representing level-2 measles reported
+```{r Load Tycho data}
+data("dalziel")
+head(dalziel)
+```
+
+* `pop` represents interpolated population sizes based on cenus
+* `rec` represents reconstructed number of births
+
+Look at data from Philadelphia, on a biweekly interval - Scarlet Fever from January 1915 to December 1947.
+We will use the `dalziel` dataset to provide census information from Philadelphia during this time period
+```{r}
+data(tyscarlet)
+tyscarlet=tyscarlet[tyscarlet$WEEK<53,] # delete occasional 53rd week reporting
+tyscarlet=tyscarlet[tyscarlet$YEAR>1914,] # focus on months starting in January 1915
+ag=rep(1:(dim(tyscarlet)[1]/2), each=2) # break into 2-week periods, add up accordingly
+scarlet2=sapply(split(tyscarlet$PHILADELPHIA, ag), sum)
+```
+
+Combine with `dalziel` to get Philadelphia's population and birth counts. We will use the `imputeTS` library to impute some missing data...
+
+```{r}
+require(imputeTS)
+philly=dalziel[dalziel$loc=="PHILADELPHIA", ] 
+philly=philly[philly$year > 1914 & philly$year < 1948,] 
+philly$cases=na.interpolation(ts(scarlet2))
+```
+
+Now we will do the same trick as before, where we use spline fitting to find the relationship between the birth rate and the measles cases - the residuals give us $D_t$:
+```{r}
+cum.reg = smooth.spline(cumsum(philly$rec), cumsum(philly$cases), df=10)
+D = - resid(cum.reg) #The residuals 
+rr = predict(cum.reg, deriv=1)$y 
+summary(rr)
+```
+From this, we know the mean reporting rate to be about 11%
+
+```{r}
+# Number of cases, adjusting for reporting
+Ic = philly$cases/rr
+Dc = D/rr
+# Seasonally label biweekly periods
+seas = rep(1:26, 21)[1:597] 
+log.I.new = log(Ic[2:598]) 
+log.I.old = log(Ic[1:597])
+D.old = Dc[1:597]
+N = median(philly$pop) 
+offsetN = rep(-log(N), 597)
+```
+
+Set up vectors for the profile likelihood of $\bar S$ and loop over candidates to obtain the MLE:
+
+```{r}
+Smean.can = seq(0.02, 0.6, by=0.001)*N 
+llik.Smean = rep(NA, length(Smean.can)) 
+for(i in 1:length(Smean.can)){
+  log.S.old = log(Smean.can[i] + D.old)
+  glmfit = glm(log.I.new ~ -1 +as.factor(seas) + log.I.old + offset(log.S.old+offsetN))
+  llik.Smean[i] = glmfit$deviance }
+
+Smean.can[which(llik.Smean==min(llik.Smean))]/N
+```
+
+Find the best estimates for alpha and our other coefficients
+```{r}
+log.S.old = log(Smean.can[which.min(llik.Smean)] + D.old)
+glmfit.best = glm(log.I.new ~ -1 + as.factor(seas) + log.I.old + offset(log.S.old+offsetN)) 
+
+#alpha
+glmfit.best$coef[27]
+```
+
+We can now plot the seasonal signal, with error bars. The authors call the gap in the summer months "suspicious"
+```{r}
+# extract beta values, and calculate error bars
+beta=exp(glmfit.best$coef[1:26]) 
+ubeta=exp(glmfit.best$coef[1:26] + summary(glmfit.best)$coef[1:26, 2]) 
+lbeta=exp(glmfit.best$coef[1:26] - summary(glmfit.best)$coef[1:26, 2]) 
+
+plotCI(x=c(1:26), y=beta, ui=ubeta, li=lbeta, xlab="Biweek", ylab=expression(beta))
+
+```
+
+## In-Host Malaria Dynamics
+We can also use TSIR-like models to look at the immunizing effect of malaria-causing pathogens.
+
+During blood-stage infection, infected RBCs burst open in synchrony every 24, 48, or 72 hours depending on species. Each of them releases 6-30 merozoites, who then look for susceptible RBCs to infect and start the replication cycle again. To use the TSIR model as an analogy here, we say that the number of infected cells at generation $t+1$ is $$I_{t+1} = P_{E,t}I_t S_t$$
+
+In this in-host model, $(S_t, I_t)$ are the number of susceptible and infected RBCs, $P_{E,t}$ is the time-varying effective propagation number (like $\beta$), which depends on "merozoite burst size," evasion of host immunity, contact rates with uninfectd RBCs, invasion probability given contact.
+
+Data: mouse parasite *Plasmodium chaubaudi*, using daily data from day 3-21 of 10 infected laboratory mice.
+
+```{r}
+data("SH9")
+# subset the RBC data
+SH9.rbc = SH9[, -c(1,3,4,7,8,10,11)]
+# reset units to microlitres
+SH9.rbc[,4] = SH9.rbc[,4]*10^6
+# subset the parasitemia data
+SH9.para = SH9[, -c(1,3,4,7,8,9,10)]
+# reshape to wide:
+SH9.rbc.w = reshape(SH9.rbc, idvar = "Ind2", direction = "wide", timevar = "Day")
+SH9.para.w = reshape(SH9.para, idvar = "Ind2", direction = "wide", timevar = "Day")
+# delete duplicate columns
+SH9.rbc.w=SH9.rbc.w[,-seq(4,50,by=2)] 
+names(SH9.rbc.w)[2]="Treatment" # renaming one of the columns
+SH9.para.w=SH9.para.w[,-seq(4,50,by=2)] 
+names(SH9.para.w)[2]="Treatment"
+
+
+#drop last columns of data not counted every day
+SH9.rbc.w=SH9.rbc.w[,-c(22:27)]
+SH9.para.w=SH9.para.w[,-c(22:27)] 
+#Pull out AQ mice 
+paras=SH9.para.w[1:10,-c(1:2)] 
+SH9.rbc.w=as.matrix(SH9.rbc.w[1:10,-c(1:2)]) 
+#Uninfected are total RBCs less infected 
+RBCs=as.matrix(SH9.rbc.w-paras)
+
+```
+
+Make a plot, 
+```{r}
+par(mfrow=c(1,2), bty="l") 
+matplot(t(log(RBCs)), type = "l", xlab = "Day", ylab = "Uninfected log-RBCs")
+matplot(t(log(paras)), type = "l", xlab = "Day", ylab = "Infected log-RBCs")
+```
+
+Log-transform and lag data, and fit the model
+```{r}
+Tmax = length(paras[1,]) # max number of days
+Nind = length(paras[,1]) # number of individuals
+day = matrix(rep(1:(Tmax-1), each = Nind), Nind, Tmax -1 )
+day = c(day)
+
+# log infected cells
+log.para = log(paras[,2:Tmax])
+log.para = unlist(c(log.para))
+log.para.lag = log(paras[,1:(Tmax -1)])
+log.para.lag = unlist(c(log.para.lag))
+
+# log uninfected cells
+log.rbcs.lag = log(RBCs[,1:(Tmax-1)])
+log.rbcs.lag = unlist(c(log.rbcs.lag))
+
+# Replace NAs
+
+log.para[!is.finite(log.para)] = min(log.para[is.finite(log.para)], na.rm = T)
+log.para.lag[!is.finite(log.para.lag)] = min(log.para[is.finite(log.para)], na.rm = T)
+```
+
+The model doesn't need the $\alpha$ exponent, because replication occurs in discrete, synchronous cycles (not treated as a continuous process - remember, the $\alpha$ exponent was used to account for information lost when fitting a discrete-time model to discrete observations of a continuous process).
+
+```{r}
+data = data.frame(log.para = log.para,
+                  day = day,
+                  log.para.lag = log.para.lag,
+                  log.rbcs.lag = log.rbcs.lag)
+fit = glm(log.para ~ -1 + as.factor(day) + offset(log.para.lag + log.rbcs.lag),
+          data = data)
+```
+Plot showing estimated propagation numbers and effective in-host reproductive numbers in mice infected with AQ *P. chaubaudi* pathogen
+```{r}
+par(mfrow=c(1,2))
+require(plotrix)
+ses = summary(fit)$coeff[,2] 
+beta=exp(fit$coef)
+ubeta=exp(fit$coef+ses) 
+lbeta=exp(fit$coef-ses)
+plotCI(x=c(3:20), y=beta, ui=ubeta, li=lbeta,xlab="Day", ylab=expression(P[E]))
+points(x=c(3:20), exp(fit$coeff), type="b",pch=19) 
+plotCI(x=c(3:20), y=beta*colMeans(RBCs)[-19], ui=ubeta* colMeans(RBCs)[-19],
+       li=lbeta*colMeans(RBCs)[-19],xlab="Day", ylab=expression(R[E])) 
+points(x=c(3:20), beta*colMeans(RBCs)[-19], type="b",pch=19) 
+abline(h=1,lty=3)
+```
+

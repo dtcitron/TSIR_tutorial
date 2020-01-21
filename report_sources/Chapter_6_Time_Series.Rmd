@@ -1,0 +1,230 @@
+---
+title: "Chapter_6_Time_Series"
+author: "Daniel T. Citron"
+date: "1/10/2020"
+output: html_document
+---
+
+# Chapter 6: Time-Series Analysis
+
+## Time domain: Autocorrelation and ARMA
+
+ACF = autocorrelation function, quantifies serial correlations at different time lags
+
+ARMA = Autoregressive moving average
+
+Both of these are classic tools for describing serial dependence in time series in the *time domain*.
+
+### ACF
+Apply ACF to the weekly time series of prevalence from the seasonally forced SEIR model, for time lags up to 3 years.
+
+Defining the SEIR model:
+```{r}
+library(deSolve)
+
+seirmod2 <- function(t, y, parms){
+  # vector of initial conditions
+  S = y[1]
+  E = y[2]
+  I = y[3]
+  R = y[4]
+  # return the derivative
+  with(as.list(parms), {
+    dS = mu * (N - S) - beta0 * (1 + beta1 * cos(2 * pi * t)) * S* I/N
+    dE = beta0 * ( 1 + beta1 * cos(2*pi*t)) * S * I/N - (mu + sigma)*E
+    dI = sigma * E - (mu + gamma) * I
+    dR = gamma * I - mu * R
+    res = c(dS, dE, dI, dR)
+    list(res)
+  })
+}
+```
+
+```{r}
+times = seq(0,100, by = 1/52)
+paras = c(mu = 1/50, N = 1, 
+          beta0 = 1000, beta1 = 0.2, sigma= 365/8, gamma = 365/5)
+xstart = c(S = 0.06, E = 0, I = 0.001, R = 0.939)
+out = as.data.frame(ode(xstart, times, seirmod2, paras))
+
+head(round(out,3))
+```
+
+```{r}
+par(mfrow = c(1,2))
+plot(times, out$I, ylab = "Infected", xlab = "Time", xlim = c(90, 100), type = "l")
+acf(out$I, lag.max = 156, main = "")
+```
+
+## ARMA
+Application: forecasting disease dynamics (ILI)
+
+ARMA(p,q) assumes that the future incidence $Y_t$ can be predicted according to $$ Y_t = a_1 Y_{t - 1} + \dots + a_p Y_{t - p} + \varepsilon_t - b_1 \varepsilon_{t - 1} - \dots - b_q \varepsilon_{t - q} $$
+
+$\varepsilon_t$ represents stochasticity, including the effects of past stochasticity
+
+Load data from the flu in iceland, and convert to a time series `ts` object and do a seasonal decomposition. The `decompose` function uses moving averages to perform a Classical Seasonal Decomposition - splits the time series into a set of additive trends: The original series, seasonal component, the trend, and the residuals (randomness)
+```{r}
+library(epimdr)
+library(forecast)
+data(Icelandflu)
+
+ilits <- ts(data = sqrt(Icelandflu$ili), 
+            start = c(1980, 1), end = c(2009, 12), frequency = 12)
+plot(decompose(ilits, type ="additive"))
+```
+
+We can now train a seasonal model for the years of 1990-2000, and perform a 24-month forecast
+ARMA(2,1), meaning that we look back across 2 years (24 months), and refer to the past 1 year of noise
+```{r}
+wts = window(ilits, start = c(1990, 6), end = c(2000,5))
+fit = arima(sqrt(wts), order = c(2, 0, 1),
+            list(order = c(1,0,0), period=12))
+coef(fit)
+```
+The forecast:
+```{r}
+fore = predict(fit, n.ahead = 24)
+
+# upper and lower limits on the forecast:
+U = fore$pred + 2 * fore$se
+L = fore$pred - 2 * fore$se
+
+ts.plot(sqrt(wts), fore$pred, U, L, col = c(1,2,4,4),
+        lty = c(1,1,2,2), ylab = "Sqrt (cases)")
+legend("bottomleft", c("ILI", "Forecast",
+"95% Error Bounds"), col=c(1, 2, 4),lty=c(1, 1, 2))
+```
+
+## Frequency domain
+
+### Schuster periodogram
+A direct way of estimating and testing for (significant) periodicity - it decomposes a time series into cycles of different frequencies, and measures the importance weight of each frequency using spectral amplitude using an FFT.
+```{r}
+# spectrum() function calculates the periodogram
+my.spec <- spectrum(out$I, plot = FALSE)
+
+# make two plots:
+par(mfrow = c(1,2))
+# plot frequency
+plot(my.spec, xlab="Frequency", ylab="Log-amplitude", main="", sub="")
+# plot with period on the x axis
+plot(1/my.spec$freq/52, my.spec$spec, type = "b", xlab = "Period (year)", ylab = "Amplitude", xlim = c(0,5))
+```
+
+### Wavelet analysis
+An extension of spectral analysis - combines the time + frequency domains. There is no set of "canonical" periods for decomposition, but we can pick a specific wavelet which will dictate which sets of periods we need
+
+Define a different SEIR model:
+```{r}
+seirmod = function(t, y, parms) { 
+    S = y[1]
+    E = y[2]
+    I = y[3]
+    R = y[4]
+    mu = parms["mu"]
+    N = parms["N"]
+    beta = parms["beta"]
+    sigma = parms["sigma"]
+    gamma = parms["gamma"]
+    dS = mu * (N - S) - beta * S * I/N
+    dE = beta * S * I/N - (mu + sigma) * E 
+    dI = sigma * E - (mu + gamma) * I
+    dR = gamma * I - mu * R
+    res = c(dS, dE, dI, dR)
+    list(res)
+}
+```
+
+```{r}
+# Simulate the time series, and plot
+times = seq(0, 25, by = 1/52)
+paras = c(mu = 1/50, N = 1,
+          beta = 1000,
+          sigma = 365/8, gamma = 365/5)
+xstart = c(S = 0.06, E = 0, I = 0.001, R = 0.939)
+out2 = as.data.frame(ode(xstart, times, seirmod, paras))
+
+plot(times, out2$I, type="l", xlab="Time",
+     ylab = "Infected")
+```
+
+Perform the wavelet analysis - we need to specify the "octaves" and the number "voices" to perform the Morlet wavelet analysis (from the `Rwave` package). 8 octaves means the main period will be $\{2^1, \dots, 2^8\}$. The number of voices specifies the subdivisions of each octave. Four voices means the resultant periods will include $\{2^1, 2^{1.25}, 2^{1.75}, 2^2, \dots \}$
+```{r}
+#install.packages("Rwave")
+require(Rwave)
+# Set the number of "octaves" and "voices"
+no = 8; nv = 32;
+# calculating periods:
+a = 2^seq(1, no + 1 - 1/nv, by = 1/nv)
+# cwt function from the Rwave package
+wfit = cwt(out2$I, no, nv, plot = FALSE)
+wspec = Mod(wfit)
+```
+
+Plot
+```{r}
+par(mfrow = c(1, 2)) #Side-by-side plots
+plot(times, out2$I, type="l", xlab="Time", ylab = "Infected")
+
+
+image(x=times, wspec, col=gray((12:32)/32), y=a/52, ylim=c(0,4), xlab="Time", ylab="Period")
+contour(x=times, wspec, y=a/52, ylim=c(0,4), zlim=c(mean(wspec), max(wspec)), add=TRUE)
+```
+How do we interpret this? At the start, the inter-epidemic period is strong, but then wanes as the system converges toward a stable epidemic (the amplitude of the oscillations decreases noticeably from the simulated data)
+
+We can take slices through this contour plot and comapre the period spectrum amplitude at different years:
+```{r}
+plot(a/52, wspec[104,], type="l", ylab="Amplitude", xlab="Period")
+lines(a/52, wspec[1040,], type="l", lty=2, col="red")
+legend("topright", legend=c("Year 2", "Year 10"), lty=c(1,2), col=c("black", "red"))
+
+```
+
+
+## Measles in London
+Pre-vaccination measles data from London during post-WW2
+
+```{r}
+data(meas)
+head(meas)
+# This includes case counts and birth counts on a 2-week interval from 1944 through 1964
+```
+Plot:
+```{r}
+par(mar = c(5,5,2,5)) #Make room for two axes 
+plot(meas$time, meas$London, type="b", xlab="Week", ylab="Incidence", ylim=c(0,8000)) 
+par(new=T) #Superimposed births plot 
+plot(meas$time, meas$B, type="l", col="red", axes=FALSE, xlab=NA, ylab=NA, ylim=c(1000, 2700)) 
+axis(side = 4)
+mtext(side = 4, line = 3, "Births") 
+legend("topright", legend=c("Cases", "Births"), lty=c(1,1), col=c("black", "red"))
+```
+We can apply wavelet analysis to the measles dynamics from London during this period (as per Grenfell 2001)
+
+On top of the wavelet analysis, we will use the "crazy climber" algorithm to identify ridges in the wavelet function - highlighting significant features
+```{r}
+#Set octaves, voices and associated periods
+no = 8; nv = 32
+a = 2^seq(1,no+1-1/nv, by = 1/nv) #Continous wavelet decomposition
+wfit = cwt(meas$London, no, nv, plot=FALSE) 
+wspec = Mod(wfit)
+#Crazy climber
+crcinc<-crc(wspec, nbclimb=10, bstep=100)
+fcrcinc<-cfamily(crcinc, ptile=0.5, nbchain=1000, bstep=10)
+## There are 2 chains.
+ridges<-fcrcinc[[1]]
+ridges[which(ridges==0)]<-NA
+#Wavelet plot with crazy-climber and contours 
+image(x=meas$time, wspec, col=gray((12:32)/32), y=a/26, ylim=c(0.1,3), ylab="Period", xlab="Year")
+contour(x=meas$time, wspec, y=a/26, ylim=c(0,3), nlevels = 6, zlim=c(mean(wspec), max(wspec)), add=TRUE)
+image(x=meas$time, y=a/26, z=ridges, add=TRUE, col=gray(0))
+```
+
+We can again take slices through this, comparing 1945 with 1954: we see the transition from annual to biennial epidemics: this is predicted by seasonally forced SEIR + dropping birth rates
+```{r}
+plot(a/26,wspec[261,], type="l",xlim=c(0,3), xlab="period (years)", ylab="amplitude")
+lines(a/26,wspec[27,], type="l", lty=2, col="red") 
+legend("topleft", legend=c("1945", "1954"), lty=c(2,1), col=c("red", "black"))
+```
+
